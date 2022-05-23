@@ -43,6 +43,7 @@ import {
   formatMessage,
   ParseError,
   parseJSON,
+  parsePackageJSON,
   parseTOML,
   readFileSync,
 } from "./parse";
@@ -206,9 +207,17 @@ function demandOneOfOption(...options: string[]) {
   };
 }
 
+/**
+ * Remove trailing white space from inputs.
+ * Matching Wrangler legacy behavior with handling inputs
+ */
+function trimTrailingWhitespace(str: string) {
+  return str.trimEnd();
+}
+
 class CommandLineArgsError extends Error {}
 
-export async function main(argv: string[]): Promise<void> {
+function createCLIParser(argv: string[]) {
   const wrangler = makeCLI(argv)
     .strict()
     // We handle errors ourselves in a try-catch around `yargs.parse`.
@@ -413,12 +422,7 @@ export async function main(argv: string[]): Promise<void> {
       try {
         isGitInstalled = (await execa("git", ["--version"])).exitCode === 0;
       } catch (err) {
-        if ((err as { code: string | undefined }).code !== "ENOENT") {
-          // only throw if the error is not because git is not installed
-          throw err;
-        } else {
-          isGitInstalled = false;
-        }
+        isGitInstalled = false;
       }
       if (!isInsideGitProject && isGitInstalled) {
         const shouldInitGit =
@@ -482,7 +486,7 @@ export async function main(argv: string[]): Promise<void> {
       } else {
         // If package.json exists and wrangler isn't installed,
         // then ask to add wrangler to devDependencies
-        const packageJson = parseJSON(
+        const packageJson = parsePackageJSON(
           readFileSync(pathToPackageJson),
           pathToPackageJson
         );
@@ -536,7 +540,7 @@ export async function main(argv: string[]): Promise<void> {
         isTypescriptProject = true;
         // If there's a tsconfig, check if @cloudflare/workers-types
         // is already installed, and offer to install it if not
-        const packageJson = parseJSON(
+        const packageJson = parsePackageJSON(
           readFileSync(pathToPackageJson),
           pathToPackageJson
         );
@@ -565,7 +569,7 @@ export async function main(argv: string[]): Promise<void> {
         }
       }
 
-      const packageJsonContent = parseJSON(
+      const packageJsonContent = parsePackageJSON(
         readFileSync(pathToPackageJson),
         pathToPackageJson
       );
@@ -897,6 +901,19 @@ export async function main(argv: string[]): Promise<void> {
       const config = readConfig(configPath, args);
       const entry = await getEntry(args, config, "dev");
 
+      if (config.services && config.services.length > 0) {
+        logger.warn(
+          `This worker is bound to live services: ${config.services
+            .map(
+              (service) =>
+                `${service.binding} (${service.service}${
+                  service.environment ? `@${service.environment}` : ""
+                })`
+            )
+            .join(", ")}`
+        );
+      }
+
       if (args.inspect) {
         logger.warn(
           "Passing --inspect is unnecessary, now you can always connect to devtools."
@@ -934,6 +951,9 @@ export async function main(argv: string[]): Promise<void> {
        * try to extract a host from it
        */
       function getHost(urlLike: string): string | undefined {
+        // strip leading * / *.
+        urlLike = urlLike.replace(/^\*(\.)?/g, "");
+
         if (
           !(urlLike.startsWith("http://") || urlLike.startsWith("https://"))
         ) {
@@ -1104,6 +1124,7 @@ export async function main(argv: string[]): Promise<void> {
                 };
               }
             ),
+            services: config.services,
             unsafe: config.unsafe?.bindings,
           }}
           crons={config.triggers.crons}
@@ -1258,7 +1279,7 @@ export async function main(argv: string[]): Promise<void> {
         );
       }
 
-      const accountId = await requireAuth(config);
+      const accountId = args.dryRun ? undefined : await requireAuth(config);
 
       const assetPaths = getAssetPaths(
         config,
@@ -1266,6 +1287,7 @@ export async function main(argv: string[]): Promise<void> {
         args.siteInclude,
         args.siteExclude
       );
+
       await publish({
         config,
         accountId,
@@ -1556,6 +1578,7 @@ export async function main(argv: string[]): Promise<void> {
                 };
               }
             ),
+            services: config.services,
             unsafe: config.unsafe?.bindings,
           }}
           crons={config.triggers.crons}
@@ -1706,9 +1729,11 @@ export async function main(argv: string[]): Promise<void> {
             const accountId = await requireAuth(config);
 
             const isInteractive = process.stdin.isTTY;
-            const secretValue = isInteractive
-              ? await prompt("Enter a secret value:", "password")
-              : await readFromStdin();
+            const secretValue = trimTrailingWhitespace(
+              isInteractive
+                ? await prompt("Enter a secret value:", "password")
+                : await readFromStdin()
+            );
 
             logger.log(
               `🌀 Creating the secret for script ${scriptName} ${
@@ -1753,6 +1778,7 @@ export async function main(argv: string[]): Promise<void> {
                       vars: {},
                       durable_objects: { bindings: [] },
                       r2_buckets: [],
+                      services: [],
                       wasm_modules: {},
                       text_blobs: {},
                       data_blobs: {},
@@ -2334,13 +2360,7 @@ export async function main(argv: string[]): Promise<void> {
             const warnings: string[] = [];
             for (let i = 0; i < content.length; i++) {
               const keyValue = content[i];
-              if (typeof keyValue !== "object") {
-                errors.push(
-                  `The item at index ${i} is type: "${typeof keyValue}" - ${JSON.stringify(
-                    keyValue
-                  )}`
-                );
-              } else if (!isKVKeyValue(keyValue)) {
+              if (!isKVKeyValue(keyValue)) {
                 errors.push(
                   `The item at index ${i} is ${JSON.stringify(keyValue)}`
                 );
@@ -2378,14 +2398,7 @@ export async function main(argv: string[]): Promise<void> {
             }
 
             const accountId = await requireAuth(config);
-            await putKVBulkKeyValue(
-              accountId,
-              namespaceId,
-              content,
-              (index, total) => {
-                logger.log(`Uploaded ${index} of ${total}.`);
-              }
-            );
+            await putKVBulkKeyValue(accountId, namespaceId, content);
 
             logger.log("Success!");
           }
@@ -2475,14 +2488,7 @@ export async function main(argv: string[]): Promise<void> {
 
             const accountId = await requireAuth(config);
 
-            await deleteKVBulkKeyValue(
-              accountId,
-              namespaceId,
-              content,
-              (index, total) => {
-                logger.log(`Deleted ${index} of ${total}.`);
-              }
-            );
+            await deleteKVBulkKeyValue(accountId, namespaceId, content);
 
             logger.log("Success!");
           }
@@ -2647,14 +2653,21 @@ export async function main(argv: string[]): Promise<void> {
   wrangler.version(wranglerVersion).alias("v", "version");
   wrangler.exitProcess(false);
 
+  return wrangler;
+}
+
+export async function main(argv: string[]): Promise<void> {
+  const wrangler = createCLIParser(argv);
   try {
     await wrangler.parse();
   } catch (e) {
     logger.log(""); // Just adds a bit of space
     if (e instanceof CommandLineArgsError) {
-      wrangler.showHelp("error");
-      logger.log(""); // Add a bit of space.
       logger.error(e.message);
+      // We are not able to ask the `wrangler` CLI parser to show help for a subcommand programmatically.
+      // The workaround is to re-run the parsing with an additional `--help` flag, which will result in the correct help message being displayed.
+      // The `wrangler` object is "frozen"; we cannot reuse that with different args, so we must create a new CLI parser to generate the help message.
+      await createCLIParser([...argv, "--help"]).parse();
     } else if (e instanceof ParseError) {
       e.notes.push({
         text: "\nIf you think this is a bug, please open an issue at: https://github.com/cloudflare/wrangler2/issues/new",
